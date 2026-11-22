@@ -42,6 +42,10 @@ let settings = {
   lockMediaMode: 'none',
   lockDuration: 20,
   idleThreshold: 300,  // 空闲阈值，秒，默认 5 分钟
+  pauseOnFullscreen: true,   // 全屏时暂停计时
+  pauseOnHighLoad: true,     // 高负载时暂停计时
+  cpuLoadThreshold: 80,      // CPU 负载阈值（%）
+  gpuLoadThreshold: 80,      // 显卡负载阈值（%）
   autoUnlock: true,    // 倒计时结束自动解锁
   snoozeMinutes: 5,    // 推迟时间（分钟）
   resetOnIdle: true,   // 空闲时重置所有任务
@@ -80,6 +84,8 @@ let stats = {
 let taskPausedStatus = {};
 let isPaused = false;
 let isIdle = false;  // 当前是否处于空闲状态
+let isBusy = false;  // 当前是否因全屏/高负载而暂停计时
+let busyInfo = { reason: 'none', cpu_load: 0, gpu_load: 0 };
 let workStartTime = Date.now();
 let activePopup = null;
 let notificationDismissing = false;
@@ -1694,6 +1700,9 @@ async function init() {
   // 同步空闲阈值到后端
   await invoke('set_idle_threshold', { seconds: settings.idleThreshold }).catch(console.error);
 
+  // 同步「全屏 / 高负载暂停」配置到后端
+  await syncBusyPauseConfig();
+
   renderFullUI();
 
   isUiSuspended = document.hidden;
@@ -1762,6 +1771,27 @@ async function init() {
       renderFullUI();
     }
 
+    if (!isUiSuspended) {
+      updateLiveValues();
+    } else {
+      updateTrayTooltip();
+    }
+  });
+
+  // 监听全屏 / 高负载占用状态变化
+  await listen('busy-status-changed', (event) => {
+    const status = event.payload;
+    const wasBusy = isBusy;
+    isBusy = !!status?.is_busy;
+    busyInfo = {
+      reason: status?.reason || 'none',
+      cpu_load: status?.cpu_load || 0,
+      gpu_load: status?.gpu_load || 0,
+    };
+    // 状态切换时更新界面与托盘提示
+    if (wasBusy !== isBusy) {
+      renderFullUI();
+    }
     if (!isUiSuspended) {
       updateLiveValues();
     } else {
@@ -1972,6 +2002,15 @@ async function loadSettings() {
 async function saveSettings() {
   await invoke('save_settings', { settings: JSON.stringify(settings) });
   emit('settings-updated', settings).catch(() => {});
+}
+
+async function syncBusyPauseConfig() {
+  await invoke('set_busy_pause_config', {
+    pauseOnFullscreen: settings.pauseOnFullscreen !== false,
+    pauseOnHighLoad: settings.pauseOnHighLoad !== false,
+    cpuLoadThreshold: Number(settings.cpuLoadThreshold) || 80,
+    gpuLoadThreshold: Number(settings.gpuLoadThreshold) || 80,
+  }).catch(console.error);
 }
 
 function saveStats() {
@@ -2886,6 +2925,45 @@ function renderFullUI() {
 
         <div class="setting-row">
           <div class="setting-info">
+            <label>${t('settings.pauseOnFullscreen')}</label>
+            <span class="setting-desc">${t('settings.pauseOnFullscreenDesc')}</span>
+          </div>
+          <div class="toggle ${settings.pauseOnFullscreen !== false ? 'active' : ''}" id="pauseOnFullscreenToggle"></div>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-info">
+            <label>${t('settings.pauseOnHighLoad')}</label>
+            <span class="setting-desc">${t('settings.pauseOnHighLoadDesc')}</span>
+          </div>
+          <div class="toggle ${settings.pauseOnHighLoad !== false ? 'active' : ''}" id="pauseOnHighLoadToggle"></div>
+        </div>
+
+        <div id="highLoadThresholds" style="display: ${settings.pauseOnHighLoad !== false ? 'block' : 'none'};">
+          <div class="setting-row">
+            <div class="setting-info">
+              <label>${t('settings.cpuLoadThreshold')}</label>
+              <span class="setting-desc">${t('settings.cpuLoadThresholdDesc')}</span>
+            </div>
+            <div class="idle-threshold-input-group">
+              <input type="number" class="idle-threshold-input" id="cpuLoadThresholdInput" value="${Number(settings.cpuLoadThreshold) || 80}" min="1" max="100">
+              <span class="input-unit">%</span>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <label>${t('settings.gpuLoadThreshold')}</label>
+              <span class="setting-desc">${t('settings.gpuLoadThresholdDesc')}</span>
+            </div>
+            <div class="idle-threshold-input-group">
+              <input type="number" class="idle-threshold-input" id="gpuLoadThresholdInput" value="${Number(settings.gpuLoadThreshold) || 80}" min="1" max="100">
+              <span class="input-unit">%</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-info">
             <label>${t('settings.enableMerge')}</label>
             <span class="setting-desc">${t('settings.enableMergeDesc')}</span>
           </div>
@@ -3585,6 +3663,18 @@ function bindEvents() {
         }
         saveSettings();
         syncTasksToBackend();
+      } else if (el.id === 'pauseOnFullscreenToggle') {
+        settings.pauseOnFullscreen = settings.pauseOnFullscreen === false;
+        el.classList.toggle('active', settings.pauseOnFullscreen !== false);
+        saveSettings();
+        syncBusyPauseConfig();
+      } else if (el.id === 'pauseOnHighLoadToggle') {
+        settings.pauseOnHighLoad = settings.pauseOnHighLoad === false;
+        el.classList.toggle('active', settings.pauseOnHighLoad !== false);
+        const rows = document.getElementById('highLoadThresholds');
+        if (rows) rows.style.display = settings.pauseOnHighLoad !== false ? 'block' : 'none';
+        saveSettings();
+        syncBusyPauseConfig();
       } else if (el.id === 'enableMergeToggle') {
         settings.enableMerge = !settings.enableMerge;
         el.classList.toggle('active', settings.enableMerge);
@@ -3897,6 +3987,30 @@ function bindEvents() {
         settings.idleThreshold = minutes * 60;  // 转换为秒
         saveSettings();
         await invoke('set_idle_threshold', { seconds: settings.idleThreshold }).catch(console.error);
+      }
+    });
+  }
+
+  const cpuLoadThresholdInput = document.getElementById('cpuLoadThresholdInput');
+  if (cpuLoadThresholdInput) {
+    cpuLoadThresholdInput.addEventListener('input', (e) => {
+      const val = parseInt(e.target.value);
+      if (val >= 1 && val <= 100) {
+        settings.cpuLoadThreshold = val;
+        saveSettings();
+        syncBusyPauseConfig();
+      }
+    });
+  }
+
+  const gpuLoadThresholdInput = document.getElementById('gpuLoadThresholdInput');
+  if (gpuLoadThresholdInput) {
+    gpuLoadThresholdInput.addEventListener('input', (e) => {
+      const val = parseInt(e.target.value);
+      if (val >= 1 && val <= 100) {
+        settings.gpuLoadThreshold = val;
+        saveSettings();
+        syncBusyPauseConfig();
       }
     });
   }

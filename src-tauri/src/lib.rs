@@ -119,6 +119,155 @@ fn get_idle_seconds_linux() -> u64 {
     }
 }
 
+// ============= 全屏 / 高负载检测（避免打扰游戏、全屏视频） =============
+
+/// 检测当前前台窗口是否处于全屏状态。
+/// 排除本程序自身的窗口（主窗口、悬浮窗、锁屏窗）。
+fn is_foreground_fullscreen() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromWindow, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
+        };
+
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0.is_null() {
+                return false;
+            }
+            // 排除本程序自身窗口
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == GetCurrentProcessId() {
+                return false;
+            }
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_err() {
+                return false;
+            }
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+                return false;
+            }
+            let m = info.rcMonitor;
+            let tol = 4; // 允许几像素边框误差
+            rect.left <= m.left + tol
+                && rect.top <= m.top + tol
+                && rect.right >= m.right - tol
+                && rect.bottom >= m.bottom - tol
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CpuSample {
+    idle: u64,
+    kernel: u64,
+    user: u64,
+}
+static LAST_CPU_SAMPLE: OnceLock<Mutex<Option<CpuSample>>> = OnceLock::new();
+
+/// 采样 CPU 当前负载百分比（0-100）。首次调用返回 0，之后用相邻两次采样差值计算。
+fn get_cpu_load_percent() -> u32 {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::SystemInformation::GetSystemTimes;
+
+        unsafe {
+            let mut idle = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            if GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).is_err() {
+                return 0;
+            }
+            let ft_to_u64 = |ft: FILETIME| -> u64 {
+                ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+            };
+            let cur = CpuSample {
+                idle: ft_to_u64(idle),
+                kernel: ft_to_u64(kernel),
+                user: ft_to_u64(user),
+            };
+            let slot = LAST_CPU_SAMPLE.get_or_init(|| Mutex::new(None));
+            let mut guard = slot.lock().unwrap();
+            let usage = match *guard {
+                Some(prev) => {
+                    // Windows 的 kernel 时间已包含 idle，总时间取 kernel+user
+                    let total = cur
+                        .kernel
+                        .saturating_sub(prev.kernel)
+                        .saturating_add(cur.user.saturating_sub(prev.user));
+                    let idle_delta = cur.idle.saturating_sub(prev.idle);
+                    let busy = total.saturating_sub(idle_delta);
+                    if total > 0 {
+                        ((busy as f64 / total as f64) * 100.0).round() as u32
+                    } else {
+                        0
+                    }
+                }
+                None => 0,
+            };
+            *guard = Some(cur);
+            usage
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        0
+    }
+}
+
+/// 采样 GPU 当前负载百分比（0-100）。通过 nvidia-smi 查询所有 NVIDIA GPU 的最大利用率；
+/// 非 NVIDIA 显卡或查询失败返回 0（此时仍可由 CPU 负载触发暂停）。
+fn get_gpu_load_percent() -> u32 {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let output = Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        if let Ok(out) = output {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                return text
+                    .lines()
+                    .filter_map(|line| line.trim().parse::<u32>().ok())
+                    .max()
+                    .unwrap_or(0);
+            }
+        }
+        0
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        0
+    }
+}
+
 struct TrayState(Mutex<Option<TrayIcon>>);
 struct FloatingState(Mutex<bool>);
 
@@ -277,6 +426,13 @@ struct TimerState {
     is_idle: bool,               // 当前是否处于空闲状态
     idle_start: Option<Instant>, // 进入空闲状态的时间点
     idle_start_timestamp: Option<i64>, // Unix 时间戳（毫秒）
+    // 全屏 / 高负载暂停（避免打扰）
+    pause_on_fullscreen: bool,   // 全屏时暂停计时
+    pause_on_high_load: bool,    // 高负载时暂停计时
+    cpu_load_threshold: u32,     // CPU 负载阈值（百分比）
+    gpu_load_threshold: u32,     // GPU 负载阈值（百分比）
+    is_busy: bool,               // 当前是否因全屏/高负载而暂停
+    busy_start: Option<Instant>, // 进入占用状态的时间点
 }
 
 impl TimerState {
@@ -293,6 +449,12 @@ impl TimerState {
             is_idle: false,
             idle_start: None,
             idle_start_timestamp: None,
+            pause_on_fullscreen: true,
+            pause_on_high_load: true,
+            cpu_load_threshold: 80,
+            gpu_load_threshold: 80,
+            is_busy: false,
+            busy_start: None,
         }
     }
 }
@@ -1100,13 +1262,18 @@ fn get_countdowns() -> Vec<CountdownInfo> {
         state.pause_start.unwrap_or(now)
     } else if state.lock_screen_active {
         state.lock_screen_start.unwrap_or(now)
+    } else if state.is_busy {
+        state.busy_start.unwrap_or(now)
     } else if state.is_idle {
         state.idle_start.unwrap_or(now)
     } else {
         now
     };
-    let globally_frozen =
-        state.paused || state.system_locked || state.lock_screen_active || state.is_idle;
+    let globally_frozen = state.paused
+        || state.system_locked
+        || state.lock_screen_active
+        || state.is_idle
+        || state.is_busy;
 
     state
         .tasks
@@ -1685,6 +1852,47 @@ fn get_idle_threshold() -> u64 {
     state.idle_threshold_seconds
 }
 
+/// 同步「全屏 / 高负载暂停」配置到后端
+#[tauri::command]
+fn set_busy_pause_config(
+    pause_on_fullscreen: bool,
+    pause_on_high_load: bool,
+    cpu_load_threshold: u32,
+    gpu_load_threshold: u32,
+) {
+    let mut state = get_timer_state().lock().unwrap();
+    state.pause_on_fullscreen = pause_on_fullscreen;
+    state.pause_on_high_load = pause_on_high_load;
+    state.cpu_load_threshold = cpu_load_threshold.clamp(1, 100);
+    state.gpu_load_threshold = gpu_load_threshold.clamp(1, 100);
+}
+
+/// 返回当前占用状态，供前端实时显示（暂停原因、负载数值）
+#[derive(Clone, serde::Serialize)]
+struct BusyStatus {
+    is_busy: bool,
+    reason: String, // "fullscreen" | "high_load" | "none"
+    cpu_load: u32,
+    gpu_load: u32,
+}
+
+#[tauri::command]
+fn get_busy_status() -> BusyStatus {
+    let state = get_timer_state().lock().unwrap();
+    BusyStatus {
+        is_busy: state.is_busy,
+        reason: if !state.is_busy {
+            "none".to_string()
+        } else if state.pause_on_fullscreen && is_foreground_fullscreen() {
+            "fullscreen".to_string()
+        } else {
+            "high_load".to_string()
+        },
+        cpu_load: 0,
+        gpu_load: 0,
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 struct IdleStatus {
     is_idle: bool,
@@ -1918,6 +2126,8 @@ fn start_timer_thread(app_handle: AppHandle) {
             let mut tasks_to_trigger: Vec<TaskTriggeredPayload> = Vec::new();
             let mut idle_status_changed = false;
             let current_idle_status;
+            let mut busy_status_changed = false;
+            let current_busy_status;
 
             {
                 let mut state = get_timer_state().lock().unwrap();
@@ -1928,6 +2138,59 @@ fn start_timer_thread(app_handle: AppHandle) {
                 }
 
                 let now = Instant::now();
+
+                // ===== 全屏 / 高负载占用检测 =====
+                let want_fullscreen = state.pause_on_fullscreen && is_foreground_fullscreen();
+                let mut cpu_load = 0u32;
+                let mut gpu_load = 0u32;
+                let want_high_load = if state.pause_on_high_load {
+                    cpu_load = get_cpu_load_percent();
+                    gpu_load = get_gpu_load_percent();
+                    cpu_load >= state.cpu_load_threshold || gpu_load >= state.gpu_load_threshold
+                } else {
+                    false
+                };
+                let is_now_busy = want_fullscreen || want_high_load;
+
+                if is_now_busy && !state.is_busy {
+                    // 刚进入占用状态：冻结所有计时器
+                    state.is_busy = true;
+                    state.busy_start = Some(now);
+                    freeze_active_timers(&mut state, now);
+                    busy_status_changed = true;
+                } else if !is_now_busy && state.is_busy {
+                    // 刚退出占用状态：补偿暂停时长后解冻
+                    state.is_busy = false;
+                    if let Some(busy_start) = state.busy_start {
+                        let pause_duration = busy_start.elapsed();
+                        for timer in state.tasks.values_mut() {
+                            timer.reset_time += pause_duration;
+                            if let Some(ref mut disabled_at) = timer.disabled_at {
+                                *disabled_at += pause_duration;
+                            } else {
+                                clear_timer_freeze(timer);
+                            }
+                        }
+                    }
+                    state.busy_start = None;
+                    busy_status_changed = true;
+                }
+
+                // 构造占用状态快照（变化时或每 tick 都算，用于实时显示负载）
+                let busy_reason = if !is_now_busy {
+                    "none"
+                } else if want_fullscreen {
+                    "fullscreen"
+                } else {
+                    "high_load"
+                };
+                current_busy_status = BusyStatus {
+                    is_busy: is_now_busy,
+                    reason: busy_reason.to_string(),
+                    cpu_load,
+                    gpu_load,
+                };
+
                 let idle_seconds = get_idle_seconds();
                 let threshold = state.idle_threshold_seconds;
                 let was_idle = state.is_idle;
@@ -1986,9 +2249,9 @@ fn start_timer_thread(app_handle: AppHandle) {
                     idle_start_timestamp: state.idle_start_timestamp,
                 };
 
-                // 如果处于空闲状态，不检查任务触发（计时暂停）
-                if state.is_idle {
-                    // 空闲时不触发任何任务，但仍然发送倒计时更新
+                // 如果处于空闲/全屏/高负载占用状态，不检查任务触发（计时暂停）
+                if state.is_idle || state.is_busy {
+                    // 占用/空闲时不触发任何任务，但仍然发送倒计时更新
                 } else {
                     // 正常检查任务触发
                     for timer in state.tasks.values_mut() {
@@ -2071,6 +2334,11 @@ fn start_timer_thread(app_handle: AppHandle) {
             // 发送空闲状态更新（只在状态变化时发送，或每 5 秒发送一次状态）
             if idle_status_changed {
                 let _ = app_handle.emit("idle-status-changed", current_idle_status.clone());
+            }
+
+            // 发送占用状态更新（状态变化时或负载数值每 5 秒刷新）
+            if busy_status_changed {
+                let _ = app_handle.emit("busy-status-changed", &current_busy_status);
             }
 
             // 发送倒计时更新
@@ -2770,6 +3038,8 @@ pub fn run() {
             timer_set_lock_screen_active,
             set_idle_threshold,
             get_idle_threshold,
+            set_busy_pause_config,
+            get_busy_status,
         ])
         .manage(TrayState(Mutex::new(None)))
         .manage(FloatingState(Mutex::new(false)))
