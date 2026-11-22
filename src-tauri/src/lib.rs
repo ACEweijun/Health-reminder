@@ -4,7 +4,7 @@ use std::fs;
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{
@@ -186,7 +186,7 @@ fn get_cpu_load_percent() -> u32 {
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::Foundation::FILETIME;
-        use windows::Win32::System::SystemInformation::GetSystemTimes;
+        use windows::Win32::System::Threading::GetSystemTimes;
 
         unsafe {
             let mut idle = FILETIME::default();
