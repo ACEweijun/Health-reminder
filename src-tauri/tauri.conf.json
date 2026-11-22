@@ -72,7 +72,7 @@
         "bundleMediaFramework": false
       }
     },
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": false
   },
   "plugins": {
     "updater": {
